@@ -147,7 +147,6 @@ describe("LlamaCpp rerank deduping", () => {
     expect(scoreByFile.get("c.md")).toBe(0.2);
   });
 });
-
 // =============================================================================
 // Integration Tests (require actual models)
 // =============================================================================
