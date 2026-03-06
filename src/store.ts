@@ -225,6 +225,41 @@ export const STRONG_SIGNAL_MIN_GAP = 0.15;
 // Max candidates to pass to reranker — balances quality vs latency.
 // 40 keeps rank 31-40 visible to the reranker (matters for recall on broad queries).
 export const RERANK_CANDIDATE_LIMIT = 40;
+export const DEFAULT_RECENCY_WEIGHT = 0.5;
+export const DEFAULT_RECENCY_HALF_LIFE_DAYS = 14;
+
+type RecencySettings = {
+  weight?: number;
+  halfLifeDays?: number;
+  nowMs?: number;
+}
+
+export function computeRecencyFactor(
+  eventDate: string,
+  settings: Pick<RecencySettings, "halfLifeDays" | "nowMs"> = {}
+): number {
+  const halfLifeDays = Math.max(settings.halfLifeDays ?? DEFAULT_RECENCY_HALF_LIFE_DAYS, 0.1);
+  const nowMs = settings.nowMs ?? Date.now();
+  const eventMs = Date.parse(eventDate);
+  if (Number.isNaN(eventMs)) return 0;
+
+  const ageMs = Math.max(0, nowMs - eventMs);
+  const ageDays = ageMs / (24 * 60 * 60 * 1000);
+  return Math.exp((-Math.log(2) * ageDays) / halfLifeDays);
+}
+
+export function applyRecencyBoost(
+  baseScore: number,
+  eventDate: string | null | undefined,
+  settings: RecencySettings = {}
+): number {
+  const normalizedBase = Math.max(0, Math.min(1, baseScore));
+  if (!eventDate) return normalizedBase;
+
+  const weight = Math.max(0, Math.min(1, settings.weight ?? DEFAULT_RECENCY_WEIGHT));
+  const recency = computeRecencyFactor(eventDate, settings);
+  return ((1 - weight) * normalizedBase) + (weight * recency);
+}
 
 /**
  * A typed query expansion result. Decoupled from llm.ts internal Queryable —
@@ -2162,6 +2197,27 @@ export function validateLexQuery(query: string): string | null {
   return null;
 }
 
+function getEventDateMap(db: Database, files: string[]): Map<string, string | null> {
+  const stmt = db.prepare(`
+    SELECT event_date
+    FROM documents
+    WHERE collection = ? AND path = ? AND active = 1
+    LIMIT 1
+  `);
+
+  const eventDateMap = new Map<string, string | null>();
+  for (const file of files) {
+    const parsed = parseVirtualPath(file);
+    if (!parsed) {
+      eventDateMap.set(file, null);
+      continue;
+    }
+    const row = stmt.get(parsed.collectionName, parsed.path) as { event_date: string | null } | undefined;
+    eventDateMap.set(file, row?.event_date ?? null);
+  }
+  return eventDateMap;
+}
+
 export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
@@ -2173,6 +2229,8 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       d.title,
       content.doc as body,
       d.hash,
+      d.modified_at,
+      d.event_date,
       bm25(documents_fts, 10.0, 1.0) as bm25_score
     FROM documents_fts f
     JOIN documents d ON d.id = f.rowid
@@ -2190,14 +2248,25 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   sql += ` ORDER BY bm25_score ASC LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
+  const rows = db.prepare(sql).all(...params) as {
+    filepath: string;
+    display_path: string;
+    title: string;
+    body: string;
+    hash: string;
+    modified_at: string;
+    event_date: string | null;
+    bm25_score: number;
+  }[];
+
   return rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
     // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
     // FTS5 BM25 scores are negative (e.g., -10 is strong, -2 is weak).
     // |x| / (1 + |x|) maps: strong(-10)→0.91, medium(-2)→0.67, weak(-0.5)→0.33, none(0)→0.
     // Monotonic and query-independent — no per-query normalization needed.
-    const score = Math.abs(row.bm25_score) / (1 + Math.abs(row.bm25_score));
+    const baseScore = Math.abs(row.bm25_score) / (1 + Math.abs(row.bm25_score));
+    const score = applyRecencyBoost(baseScore, row.event_date);
     return {
       filepath: row.filepath,
       displayPath: row.display_path,
@@ -2205,14 +2274,14 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       hash: row.hash,
       docid: getDocid(row.hash),
       collectionName,
-      modifiedAt: "",  // Not available in FTS query
+      modifiedAt: row.modified_at,
       bodyLength: row.body.length,
       body: row.body,
       context: getContextForFile(db, row.filepath),
       score,
       source: "fts" as const,
     };
-  });
+  }).sort((a, b) => b.score - a.score);
 }
 
 // =============================================================================
@@ -2254,6 +2323,8 @@ export async function searchVec(db: Database, query: string, model: string, limi
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
+      d.modified_at,
+      d.event_date,
       content.doc as body
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
@@ -2269,7 +2340,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   const docRows = db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; filepath: string;
-    display_path: string; title: string; body: string;
+    display_path: string; title: string; modified_at: string; event_date: string | null; body: string;
   }[];
 
   // Combine with distances and dedupe by filepath
@@ -2283,10 +2354,10 @@ export async function searchVec(db: Database, query: string, model: string, limi
   }
 
   return Array.from(seen.values())
-    .sort((a, b) => a.bestDist - b.bestDist)
-    .slice(0, limit)
     .map(({ row, bestDist }) => {
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
+      const baseScore = 1 - bestDist;  // Cosine similarity = 1 - cosine distance
+      const score = applyRecencyBoost(baseScore, row.event_date);
       return {
         filepath: row.filepath,
         displayPath: row.display_path,
@@ -2294,15 +2365,17 @@ export async function searchVec(db: Database, query: string, model: string, limi
         hash: row.hash,
         docid: getDocid(row.hash),
         collectionName,
-        modifiedAt: "",  // Not available in vec query
+        modifiedAt: row.modified_at,
         bodyLength: row.body.length,
         body: row.body,
         context: getContextForFile(db, row.filepath),
-        score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
+        score,
         source: "vec" as const,
         chunkPos: row.pos,
       };
-    });
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
 }
 
 // =============================================================================
@@ -3265,6 +3338,7 @@ export async function hybridQuery(
     displayPath: c.displayPath, title: c.title, body: c.body,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
+  const eventDateMap = getEventDateMap(store.db, candidates.map(c => c.file));
 
   const blended = reranked.map(r => {
     const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
@@ -3274,6 +3348,7 @@ export async function hybridQuery(
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const score = applyRecencyBoost(blendedScore, eventDateMap.get(r.file) ?? null);
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
@@ -3304,7 +3379,7 @@ export async function hybridQuery(
       body: candidate?.body || "",
       bestChunk,
       bestChunkPos,
-      score: blendedScore,
+      score,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
       ...(explainData ? { explain: explainData } : {}),
@@ -3604,6 +3679,7 @@ export async function structuredSearch(
     displayPath: c.displayPath, title: c.title, body: c.body,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
+  const eventDateMap = getEventDateMap(store.db, candidates.map(c => c.file));
 
   const blended = reranked.map(r => {
     const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
@@ -3613,6 +3689,7 @@ export async function structuredSearch(
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const score = applyRecencyBoost(blendedScore, eventDateMap.get(r.file) ?? null);
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
@@ -3643,7 +3720,7 @@ export async function structuredSearch(
       body: candidate?.body || "",
       bestChunk,
       bestChunkPos,
-      score: blendedScore,
+      score,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
       ...(explainData ? { explain: explainData } : {}),

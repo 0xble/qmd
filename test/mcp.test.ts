@@ -56,6 +56,7 @@ function initTestDatabase(db: Database): void {
       hash TEXT NOT NULL,
       created_at TEXT NOT NULL,
       modified_at TEXT NOT NULL,
+      event_date TEXT,
       active INTEGER NOT NULL DEFAULT 1,
       FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
       UNIQUE(collection, path)
@@ -155,9 +156,9 @@ function seedTestData(db: Database): void {
 
     // Then insert document metadata
     db.prepare(`
-      INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-      VALUES ('docs', ?, ?, ?, ?, ?, 1)
-    `).run(doc.path, doc.title, doc.hash, now, now);
+      INSERT INTO documents (collection, path, title, hash, created_at, modified_at, event_date, active)
+      VALUES ('docs', ?, ?, ?, ?, ?, ?, 1)
+    `).run(doc.path, doc.title, doc.hash, now, now, now);
   }
 
   // Add embeddings for vector search
@@ -716,9 +717,9 @@ describe("MCP Server", () => {
 
       // Then insert document metadata
       testDb.prepare(`
-        INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-        VALUES ('docs', ?, ?, ?, ?, ?, 1)
-      `).run(path, "Podcast Episode", hash, now, now);
+        INSERT INTO documents (collection, path, title, hash, created_at, modified_at, event_date, active)
+        VALUES ('docs', ?, ?, ?, ?, ?, ?, 1)
+      `).run(path, "Podcast Episode", hash, now, now, now);
 
       // Simulate URL-encoded path from MCP client
       const encodedPath = "External%20Podcast%2F2023%20April%20-%20Interview.md";
