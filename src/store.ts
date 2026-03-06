@@ -656,15 +656,22 @@ function initializeDatabase(db: Database): void {
       hash TEXT NOT NULL,
       created_at TEXT NOT NULL,
       modified_at TEXT NOT NULL,
+      event_date TEXT,
       active INTEGER NOT NULL DEFAULT 1,
       FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
       UNIQUE(collection, path)
     )
   `);
 
+  const docColumns = db.prepare(`PRAGMA table_info(documents)`).all() as { name: string }[];
+  if (!docColumns.some(col => col.name === "event_date")) {
+    db.exec(`ALTER TABLE documents ADD COLUMN event_date TEXT`);
+  }
+
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_event_date ON documents(event_date, active)`);
 
   // Cache table for LLM API calls
   db.exec(`
@@ -824,10 +831,10 @@ export type Store = {
 
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
-  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
+  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, eventDate?: string | null) => void;
   findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
-  updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
-  updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
+  updateDocumentTitle: (documentId: number, title: string, modifiedAt: string, eventDate?: string | null) => void;
+  updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string, eventDate?: string | null) => void;
   deactivateDocument: (collectionName: string, path: string) => void;
   getActiveDocumentPaths: (collectionName: string) => string[];
 
@@ -907,10 +914,10 @@ export function createStore(dbPath?: string): Store {
 
     // Document indexing operations
     insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
-    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt),
+    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, eventDate?: string | null) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt, eventDate),
     findActiveDocument: (collectionName: string, path: string) => findActiveDocument(db, collectionName, path),
-    updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => updateDocumentTitle(db, documentId, title, modifiedAt),
-    updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => updateDocument(db, documentId, title, hash, modifiedAt),
+    updateDocumentTitle: (documentId: number, title: string, modifiedAt: string, eventDate?: string | null) => updateDocumentTitle(db, documentId, title, modifiedAt, eventDate),
+    updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string, eventDate?: string | null) => updateDocument(db, documentId, title, hash, modifiedAt, eventDate),
     deactivateDocument: (collectionName: string, path: string) => deactivateDocument(db, collectionName, path),
     getActiveDocumentPaths: (collectionName: string) => getActiveDocumentPaths(db, collectionName),
 
@@ -1326,17 +1333,19 @@ export function insertDocument(
   title: string,
   hash: string,
   createdAt: string,
-  modifiedAt: string
+  modifiedAt: string,
+  eventDate?: string | null
 ): void {
   db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-    VALUES (?, ?, ?, ?, ?, ?, 1)
+    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, event_date, active)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
     ON CONFLICT(collection, path) DO UPDATE SET
       title = excluded.title,
       hash = excluded.hash,
       modified_at = excluded.modified_at,
+      event_date = excluded.event_date,
       active = 1
-  `).run(collectionName, path, title, hash, createdAt, modifiedAt);
+  `).run(collectionName, path, title, hash, createdAt, modifiedAt, eventDate ?? null);
 }
 
 /**
@@ -1361,10 +1370,16 @@ export function updateDocumentTitle(
   db: Database,
   documentId: number,
   title: string,
-  modifiedAt: string
+  modifiedAt: string,
+  eventDate?: string | null
 ): void {
-  db.prepare(`UPDATE documents SET title = ?, modified_at = ? WHERE id = ?`)
-    .run(title, modifiedAt, documentId);
+  if (eventDate === undefined) {
+    db.prepare(`UPDATE documents SET title = ?, modified_at = ? WHERE id = ?`)
+      .run(title, modifiedAt, documentId);
+    return;
+  }
+  db.prepare(`UPDATE documents SET title = ?, modified_at = ?, event_date = ? WHERE id = ?`)
+    .run(title, modifiedAt, eventDate, documentId);
 }
 
 /**
@@ -1376,10 +1391,16 @@ export function updateDocument(
   documentId: number,
   title: string,
   hash: string,
-  modifiedAt: string
+  modifiedAt: string,
+  eventDate?: string | null
 ): void {
-  db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
-    .run(title, hash, modifiedAt, documentId);
+  if (eventDate === undefined) {
+    db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
+      .run(title, hash, modifiedAt, documentId);
+    return;
+  }
+  db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ?, event_date = ? WHERE id = ?`)
+    .run(title, hash, modifiedAt, eventDate, documentId);
 }
 
 /**

@@ -114,7 +114,11 @@ beforeAll(async () => {
   // Create test markdown files
   await writeFile(
     join(fixturesDir, "README.md"),
-    `# Test Project
+    `---
+date: 2024-01-10
+---
+
+# Test Project
 
 This is a test project for QMD CLI testing.
 
@@ -128,7 +132,11 @@ This is a test project for QMD CLI testing.
 
   await writeFile(
     join(fixturesDir, "notes", "meeting.md"),
-    `# Team Meeting Notes
+    `---
+date: 2024-01-15
+---
+
+# Team Meeting Notes
 
 Date: 2024-01-15
 
@@ -151,7 +159,11 @@ Date: 2024-01-15
 
   await writeFile(
     join(fixturesDir, "notes", "ideas.md"),
-    `# Product Ideas
+    `---
+date: 2024-02-01
+---
+
+# Product Ideas
 
 ## Feature Requests
 - Dark mode support
@@ -167,7 +179,11 @@ Date: 2024-01-15
 
   await writeFile(
     join(fixturesDir, "docs", "api.md"),
-    `# API Documentation
+    `---
+date: 2024-02-10
+---
+
+# API Documentation
 
 ## Endpoints
 
@@ -189,7 +205,11 @@ Index new documents.
   // Create test files for path normalization tests
   await writeFile(
     join(fixturesDir, "test1.md"),
-    `# Test Document 1
+    `---
+date: 2024-03-01
+---
+
+# Test Document 1
 
 This is the first test document.
 
@@ -201,7 +221,11 @@ Line 7 is here.
 
   await writeFile(
     join(fixturesDir, "test2.md"),
-    `# Test Document 2
+    `---
+date: 2024-03-02
+---
+
+# Test Document 2
 
 This is the second test document.
 `
@@ -377,6 +401,71 @@ describe("CLI Search Command", () => {
     expect(exitCode).toBe(1);
     // Error message goes to stderr
     expect(stderr).toContain("Usage:");
+  });
+});
+
+describe("CLI Date Filters", () => {
+  let localDbPath: string;
+  let localConfigDir: string;
+  let datedDir: string;
+
+  beforeAll(async () => {
+    const env = await createIsolatedTestEnv("date-filters");
+    localDbPath = env.dbPath;
+    localConfigDir = env.configDir;
+    datedDir = await mkdtemp(join(tmpdir(), "qmd-date-filter-"));
+
+    await writeFile(
+      join(datedDir, "jan.md"),
+      "---\ndate: 2024-01-15\n---\n\n# January\n\ntimeline keyword alpha"
+    );
+    await writeFile(
+      join(datedDir, "feb.md"),
+      "---\ndate: 2024-02-15\n---\n\n# February\n\ntimeline keyword beta"
+    );
+    await writeFile(
+      join(datedDir, "mar.md"),
+      "---\ndate: 2024-03-15\n---\n\n# March\n\ntimeline keyword gamma"
+    );
+
+    const addResult = await runQmd(
+      ["collection", "add", datedDir, "--name", "datedocs"],
+      { dbPath: localDbPath, configDir: localConfigDir }
+    );
+    expect(addResult.exitCode).toBe(0);
+  });
+
+  test("filters with --since", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["search", "--json", "--all", "--since", "2024-02-01", "timeline keyword"],
+      { dbPath: localDbPath, configDir: localConfigDir }
+    );
+    expect(exitCode).toBe(0);
+    const files = (JSON.parse(stdout) as Array<{ file: string }>).map(r => r.file);
+    expect(files).toContain("qmd://datedocs/feb.md");
+    expect(files).toContain("qmd://datedocs/mar.md");
+    expect(files).not.toContain("qmd://datedocs/jan.md");
+  });
+
+  test("filters with --until", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["search", "--json", "--all", "--until", "2024-02-28", "timeline keyword"],
+      { dbPath: localDbPath, configDir: localConfigDir }
+    );
+    expect(exitCode).toBe(0);
+    const files = (JSON.parse(stdout) as Array<{ file: string }>).map(r => r.file);
+    expect(files).toContain("qmd://datedocs/jan.md");
+    expect(files).toContain("qmd://datedocs/feb.md");
+    expect(files).not.toContain("qmd://datedocs/mar.md");
+  });
+
+  test("rejects combining --last with --since", async () => {
+    const { stderr, exitCode } = await runQmd(
+      ["search", "--last", "7", "--since", "2024-01-01", "timeline keyword"],
+      { dbPath: localDbPath, configDir: localConfigDir }
+    );
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Cannot combine --last with --since/--until");
   });
 });
 
@@ -786,6 +875,32 @@ describe("CLI Collection Commands", () => {
     expect(stdout).toContain("Files:");
   });
 
+  test("fails add when required frontmatter date is missing", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "qmd-no-date-"));
+    await writeFile(join(tempDir, "missing.md"), "# Missing Date\n\nNo frontmatter.");
+
+    const { stderr, exitCode } = await runQmd(["collection", "add", tempDir, "--name", "nodate"], { dbPath: localDbPath });
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Missing required frontmatter date");
+  });
+
+  test("allow-missing-date lets update succeed without date frontmatter", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "qmd-optional-date-"));
+    await writeFile(join(tempDir, "doc.md"), "---\ndate: 2024-05-01\n---\n\n# Optional Date");
+
+    const addResult = await runQmd(["collection", "add", tempDir, "--name", "optional-date"], { dbPath: localDbPath });
+    expect(addResult.exitCode).toBe(0);
+
+    const toggle = await runQmd(["collection", "allow-missing-date", "optional-date"], { dbPath: localDbPath });
+    expect(toggle.exitCode).toBe(0);
+    expect(toggle.stdout).toContain("no longer requires frontmatter date");
+
+    await writeFile(join(tempDir, "doc.md"), "# Optional Date\n\nNow missing frontmatter date.");
+
+    const update = await runQmd(["update"], { dbPath: localDbPath });
+    expect(update.exitCode).toBe(0);
+  });
+
   test("removes a collection", async () => {
     // First verify the collection exists
     const { stdout: listBefore } = await runQmd(["collection", "list"], { dbPath: localDbPath });
@@ -847,7 +962,7 @@ describe("CLI Collection Commands", () => {
   test("handles renaming to existing collection name", async () => {
     // Create a second collection in a temp directory
     const tempDir = await mkdtemp(join(tmpdir(), "qmd-second-"));
-    await writeFile(join(tempDir, "test.md"), "# Test");
+    await writeFile(join(tempDir, "test.md"), "---\ndate: 2024-04-01\n---\n\n# Test");
     const addResult = await runQmd(["collection", "add", tempDir, "--name", "second"], { dbPath: localDbPath });
 
     if (addResult.exitCode !== 0) {
@@ -1113,25 +1228,25 @@ describe("get command path normalization", () => {
   });
 
   test("get with qmd://collection/path format", async () => {
-    const { stdout, exitCode } = await runQmd(["get", `qmd://${collName}/test1.md`, "-l", "3"], { dbPath: localDbPath, configDir: localConfigDir });
+    const { stdout, exitCode } = await runQmd(["get", `qmd://${collName}/test1.md`, "-l", "6"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Test Document 1");
   });
 
   test("get with collection/path format (no scheme)", async () => {
-    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md`, "-l", "3"], { dbPath: localDbPath, configDir: localConfigDir });
+    const { stdout, exitCode } = await runQmd(["get", `${collName}/test1.md`, "-l", "6"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Test Document 1");
   });
 
   test("get with //collection/path format", async () => {
-    const { stdout, exitCode } = await runQmd(["get", `//${collName}/test1.md`, "-l", "3"], { dbPath: localDbPath, configDir: localConfigDir });
+    const { stdout, exitCode } = await runQmd(["get", `//${collName}/test1.md`, "-l", "6"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Test Document 1");
   });
 
   test("get with qmd:////collection/path format (extra slashes)", async () => {
-    const { stdout, exitCode } = await runQmd(["get", `qmd:////${collName}/test1.md`, "-l", "3"], { dbPath: localDbPath, configDir: localConfigDir });
+    const { stdout, exitCode } = await runQmd(["get", `qmd:////${collName}/test1.md`, "-l", "6"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Test Document 1");
   });

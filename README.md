@@ -317,6 +317,10 @@ qmd collection remove myproject
 # Rename a collection
 qmd collection rename myproject my-project
 
+# Date policy per collection (default is required)
+qmd collection require-date notes
+qmd collection allow-missing-date notes
+
 # List files in a collection
 qmd ls notes
 qmd ls notes/subfolder
@@ -386,6 +390,9 @@ qmd query "user authentication"
 -c, --collection   # Restrict search to a specific collection
 --all              # Return all matches (use with --min-score to filter)
 --min-score <num>  # Minimum score threshold (default: 0)
+--since <date>     # Include docs on/after date (YYYY-MM-DD or RFC3339)
+--until <date>     # Include docs on/before date (YYYY-MM-DD or RFC3339)
+--last <days>      # Shortcut for docs from the last N days
 --full             # Show full document content
 --line-numbers     # Add line numbers to output
 --explain          # Include retrieval score traces (query, JSON/CLI output)

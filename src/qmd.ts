@@ -271,6 +271,164 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
+type DateRangeFilter = {
+  since?: string;
+  until?: string;
+}
+
+type EventDateParseResult = {
+  eventDate: string | null;
+  hasDateField: boolean;
+  error: string | null;
+}
+
+function parseStrictDateValue(raw: string): string | null {
+  const trimmed = raw.trim();
+  const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(trimmed);
+  if (isDateOnly) {
+    return `${trimmed}T00:00:00.000Z`;
+  }
+
+  const isRfc3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(trimmed);
+  if (!isRfc3339) return null;
+
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString();
+}
+
+function extractFrontmatterEventDate(content: string): EventDateParseResult {
+  const frontmatterMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!frontmatterMatch) {
+    return { eventDate: null, hasDateField: false, error: null };
+  }
+
+  const block = frontmatterMatch[1] || "";
+  const lines = block.split(/\r?\n/);
+  const dateLine = lines.find(line => /^\s*date\s*:/.test(line));
+  if (!dateLine) {
+    return { eventDate: null, hasDateField: false, error: null };
+  }
+
+  let value = dateLine.replace(/^\s*date\s*:\s*/, "").trim();
+  if (!value) {
+    return { eventDate: null, hasDateField: true, error: "date is empty" };
+  }
+
+  if (
+    (value.startsWith('"') && value.endsWith('"'))
+    || (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    value = value.slice(1, -1).trim();
+  } else {
+    value = value.replace(/\s+#.*$/, "").trim();
+  }
+
+  const normalized = parseStrictDateValue(value);
+  if (!normalized) {
+    return {
+      eventDate: null,
+      hasDateField: true,
+      error: "date must be YYYY-MM-DD or RFC3339",
+    };
+  }
+
+  return { eventDate: normalized, hasDateField: true, error: null };
+}
+
+function parseDateRangeFromCli(values: Record<string, unknown>): DateRangeFilter | undefined {
+  const rawSince = typeof values.since === "string" ? values.since.trim() : "";
+  const rawUntil = typeof values.until === "string" ? values.until.trim() : "";
+  const rawLast = typeof values.last === "string" ? values.last.trim() : "";
+
+  if (!rawSince && !rawUntil && !rawLast) return undefined;
+
+  if (rawLast && (rawSince || rawUntil)) {
+    console.error("Cannot combine --last with --since/--until.");
+    process.exit(1);
+  }
+
+  if (rawLast) {
+    const days = Number.parseInt(rawLast, 10);
+    if (!Number.isFinite(days) || days <= 0) {
+      console.error("--last must be a positive integer number of days.");
+      process.exit(1);
+    }
+    const since = new Date(Date.now() - (days * 24 * 60 * 60 * 1000)).toISOString();
+    return { since };
+  }
+
+  const filter: DateRangeFilter = {};
+  if (rawSince) {
+    const since = parseStrictDateValue(rawSince);
+    if (!since) {
+      console.error(`Invalid --since value '${rawSince}'. Use YYYY-MM-DD or RFC3339.`);
+      process.exit(1);
+    }
+    filter.since = since;
+  }
+
+  if (rawUntil) {
+    const until = parseStrictDateValue(rawUntil);
+    if (!until) {
+      console.error(`Invalid --until value '${rawUntil}'. Use YYYY-MM-DD or RFC3339.`);
+      process.exit(1);
+    }
+    filter.until = until;
+  }
+
+  if (filter.since && filter.until && filter.since > filter.until) {
+    console.error("--since must be earlier than or equal to --until.");
+    process.exit(1);
+  }
+
+  return filter;
+}
+
+function isWithinDateRange(eventDate: string, range: DateRangeFilter): boolean {
+  if (range.since && eventDate < range.since) return false;
+  if (range.until && eventDate > range.until) return false;
+  return true;
+}
+
+function filterResultsByDateRange<T extends { file?: string; filepath?: string }>(
+  db: Database,
+  results: T[],
+  range?: DateRangeFilter
+): T[] {
+  if (!range) return results;
+
+  const dateStmt = db.prepare(`
+    SELECT event_date
+    FROM documents
+    WHERE collection = ? AND path = ? AND active = 1
+    LIMIT 1
+  `);
+  const cache = new Map<string, string | null>();
+
+  return results.filter(result => {
+    const virtualPath = result.filepath || result.file;
+    if (!virtualPath) return false;
+
+    const cached = cache.get(virtualPath);
+    if (cached !== undefined) {
+      return cached !== null && isWithinDateRange(cached, range);
+    }
+
+    const parsed = parseVirtualPath(virtualPath);
+    if (!parsed) {
+      cache.set(virtualPath, null);
+      return false;
+    }
+
+    const row = dateStmt.get(parsed.collectionName, parsed.path) as { event_date: string | null } | undefined;
+    const eventDate = row?.event_date || null;
+    cache.set(virtualPath, eventDate);
+
+    return eventDate !== null && isWithinDateRange(eventDate, range);
+  });
+}
+
 async function showStatus(): Promise<void> {
   const dbPath = getDbPath();
   const db = getDb();
@@ -1416,6 +1574,8 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   if (!collectionName) {
     throw new Error("Collection name is required. Collections must be defined in ~/.config/qmd/index.yml");
   }
+  const collectionConfig = getCollectionFromYaml(collectionName);
+  const shouldRequireDate = collectionConfig?.requireDate !== false;
 
   console.log(`Collection: ${resolvedPwd} (${globPattern})`);
 
@@ -1448,85 +1608,129 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
   const seenPaths = new Set<string>();
   const startTime = Date.now();
+  let removed = 0;
+  let orphanedContent = 0;
+  let needsEmbedding = 0;
 
-  for (const relativeFile of files) {
-    const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
-    const path = handelize(relativeFile); // Normalize path for token-friendliness
-    seenPaths.add(path);
+  try {
+    db.exec("BEGIN");
 
-    let content: string;
-    try {
-      content = readFileSync(filepath, "utf-8");
-    } catch (err: any) {
-      // Skip files that can't be read (e.g. iCloud evicted files returning EAGAIN)
-      processed++;
-      progress.set((processed / total) * 100);
-      continue;
-    }
+    for (const relativeFile of files) {
+      const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
+      const path = handelize(relativeFile); // Normalize path for token-friendliness
+      seenPaths.add(path);
 
-    // Skip empty files - nothing useful to index
-    if (!content.trim()) {
-      processed++;
-      continue;
-    }
+      let content: string;
+      try {
+        content = readFileSync(filepath, "utf-8");
+      } catch (_err: unknown) {
+        // Skip files that can't be read, for example evicted iCloud files.
+        processed++;
+        progress.set((processed / total) * 100);
+        continue;
+      }
 
-    const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
+      // Skip empty files - nothing useful to index
+      if (!content.trim()) {
+        processed++;
+        continue;
+      }
 
-    // Check if document exists in this collection with this path
-    const existing = findActiveDocument(db, collectionName, path);
+      const dateResult = extractFrontmatterEventDate(content);
+      if (dateResult.error) {
+        throw new Error(
+          `Invalid date in '${relativeFile}': ${dateResult.error}. `
+          + "Use YYYY-MM-DD or RFC3339."
+        );
+      }
+      if (shouldRequireDate && !dateResult.hasDateField) {
+        throw new Error(
+          `Missing required frontmatter date in '${relativeFile}'. `
+          + `Collection '${collectionName}' requires 'date'. `
+          + `Use 'qmd collection allow-missing-date ${collectionName}' to opt out.`
+        );
+      }
 
-    if (existing) {
-      if (existing.hash === hash) {
-        // Hash unchanged, but check if title needs updating
-        if (existing.title !== title) {
-          updateDocumentTitle(db, existing.id, title, now);
-          updated++;
+      const hash = await hashContent(content);
+      const title = extractTitle(content, relativeFile);
+      const eventDate = dateResult.eventDate;
+
+      // Check if document exists in this collection with this path
+      const existing = findActiveDocument(db, collectionName, path);
+
+      if (existing) {
+        if (existing.hash === hash) {
+          // Hash unchanged, but check if title needs updating
+          if (existing.title !== title) {
+            updateDocumentTitle(db, existing.id, title, now, eventDate);
+            updated++;
+          } else {
+            unchanged++;
+          }
         } else {
-          unchanged++;
+          // Content changed - insert new content hash and update document
+          insertContent(db, hash, content, now);
+          const stat = statSync(filepath);
+          updateDocument(
+            db,
+            existing.id,
+            title,
+            hash,
+            stat ? new Date(stat.mtime).toISOString() : now,
+            eventDate
+          );
+          updated++;
         }
       } else {
-        // Content changed - insert new content hash and update document
+        // New document - insert content and document
+        indexed++;
         insertContent(db, hash, content, now);
         const stat = statSync(filepath);
-        updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
-        updated++;
+        insertDocument(
+          db,
+          collectionName,
+          path,
+          title,
+          hash,
+          stat ? new Date(stat.birthtime).toISOString() : now,
+          stat ? new Date(stat.mtime).toISOString() : now,
+          eventDate
+        );
       }
-    } else {
-      // New document - insert content and document
-      indexed++;
-      insertContent(db, hash, content, now);
-      const stat = statSync(filepath);
-      insertDocument(db, collectionName, path, title, hash,
-        stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
+
+      processed++;
+      progress.set((processed / total) * 100);
+      const elapsed = (Date.now() - startTime) / 1000;
+      const rate = processed / elapsed;
+      const remaining = (total - processed) / rate;
+      const eta = processed > 2 ? ` ETA: ${formatETA(remaining)}` : "";
+      if (isTTY) process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
     }
 
-    processed++;
-    progress.set((processed / total) * 100);
-    const elapsed = (Date.now() - startTime) / 1000;
-    const rate = processed / elapsed;
-    const remaining = (total - processed) / rate;
-    const eta = processed > 2 ? ` ETA: ${formatETA(remaining)}` : "";
-    if (isTTY) process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
-  }
-
-  // Deactivate documents in this collection that no longer exist
-  const allActive = getActiveDocumentPaths(db, collectionName);
-  let removed = 0;
-  for (const path of allActive) {
-    if (!seenPaths.has(path)) {
-      deactivateDocument(db, collectionName, path);
-      removed++;
+    // Deactivate documents in this collection that no longer exist.
+    const allActive = getActiveDocumentPaths(db, collectionName);
+    for (const path of allActive) {
+      if (!seenPaths.has(path)) {
+        deactivateDocument(db, collectionName, path);
+        removed++;
+      }
     }
+
+    // Clean up orphaned content hashes (content not referenced by any document)
+    orphanedContent = cleanupOrphanedContent(db);
+
+    // Check if vector index needs updating
+    needsEmbedding = getHashesNeedingEmbedding(db);
+
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    progress.clear();
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`\n${c.yellow}✗ Indexing failed: ${message}${c.reset}`);
+    closeDb();
+    process.exit(1);
   }
-
-  // Clean up orphaned content hashes (content not referenced by any document)
-  const orphanedContent = cleanupOrphanedContent(db);
-
-  // Check if vector index needs updating
-  const needsEmbedding = getHashesNeedingEmbedding(db);
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
@@ -1772,6 +1976,7 @@ type OutputOptions = {
   context?: string;      // Optional context for query expansion
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
   intent?: string;       // Domain intent for disambiguation
+  dateRange?: DateRangeFilter;
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2122,9 +2327,13 @@ function search(query: string, opts: OutputOptions): void {
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection),
-    collectionNames
+  const results = filterResultsByDateRange(
+    db,
+    filterByCollections(
+      searchFTS(db, query, fetchLimit, singleCollection),
+      collectionNames
+    ),
+    opts.dateRange
   );
 
   // Add context to results
@@ -2194,6 +2403,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
         return prefixes.some(p => r.file.startsWith(p));
       });
     }
+    results = filterResultsByDateRange(store.db, results, opts.dateRange);
 
     closeDb();
 
@@ -2319,6 +2529,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         return prefixes.some(p => r.file.startsWith(p));
       });
     }
+    results = filterResultsByDateRange(store.db, results, opts.dateRange);
 
     closeDb();
 
@@ -2368,6 +2579,9 @@ function parseCLI() {
       "min-score": { type: "string" },
       all: { type: "boolean" },
       full: { type: "boolean" },
+      since: { type: "string" },
+      until: { type: "string" },
+      last: { type: "string" },
       csv: { type: "boolean" },
       md: { type: "boolean" },
       xml: { type: "boolean" },
@@ -2419,6 +2633,7 @@ function parseCLI() {
   // --all means return all results (use very large limit)
   const defaultLimit = (format === "files" || format === "json") ? 20 : 5;
   const isAll = !!values.all;
+  const dateRange = parseDateRangeFromCli(values);
 
   const opts: OutputOptions = {
     format,
@@ -2431,6 +2646,7 @@ function parseCLI() {
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     explain: !!values.explain,
     intent: values.intent as string | undefined,
+    dateRange,
   };
 
   return {
@@ -2532,6 +2748,9 @@ function showHelp(): void {
   console.log("  -n <num>                   - Max results (default 5, or 20 for --files/--json)");
   console.log("  --all                      - Return all matches (pair with --min-score)");
   console.log("  --min-score <num>          - Minimum similarity score");
+  console.log("  --since <date>             - Include docs on/after date (YYYY-MM-DD or RFC3339)");
+  console.log("  --until <date>             - Include docs on/before date (YYYY-MM-DD or RFC3339)");
+  console.log("  --last <days>              - Shortcut for docs from the last N days");
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --line-numbers             - Include line numbers in output");
@@ -2779,6 +2998,25 @@ if (isMain) {
           break;
         }
 
+        case "require-date":
+        case "allow-missing-date": {
+          const name = cli.args[1];
+          if (!name) {
+            console.error(`Usage: qmd collection ${subcommand} <name>`);
+            process.exit(1);
+          }
+          const { updateCollectionSettings, getCollection } = await import("./collections.js");
+          const col = getCollection(name);
+          if (!col) {
+            console.error(`Collection not found: ${name}`);
+            process.exit(1);
+          }
+          const requireDate = subcommand === "require-date";
+          updateCollectionSettings(name, { requireDate });
+          console.log(`✓ Collection '${name}' ${requireDate ? "now requires" : "no longer requires"} frontmatter date`);
+          break;
+        }
+
         case "show":
         case "info": {
           const name = cli.args[1];
@@ -2796,6 +3034,7 @@ if (isMain) {
           console.log(`  Path:     ${col.path}`);
           console.log(`  Pattern:  ${col.pattern}`);
           console.log(`  Include:  ${col.includeByDefault !== false ? 'yes (default)' : 'no'}`);
+          console.log(`  Date:     ${col.requireDate !== false ? 'required (default)' : 'optional'}`);
           if (col.update) {
             console.log(`  Update:   ${col.update}`);
           }
@@ -2819,6 +3058,8 @@ if (isMain) {
           console.log("  update-cmd <name> [cmd]   Set pre-update command (e.g., 'git pull')");
           console.log("  include <name>            Include in default queries");
           console.log("  exclude <name>            Exclude from default queries");
+          console.log("  require-date <name>       Require frontmatter date during indexing");
+          console.log("  allow-missing-date <name> Allow indexing docs without date");
           console.log("");
           console.log("Examples:");
           console.log("  qmd collection add ~/notes --name notes");
