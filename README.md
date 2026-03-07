@@ -40,6 +40,7 @@ qmd query "quarterly planning process"  # Hybrid + reranking (best quality)
 
 # Get a specific document
 qmd get "meetings/2024-01-15.md"
+qmd get "ucs://session/claude/test-session"
 
 # Get a document by docid (shown in search results)
 qmd get "#abc123"
@@ -50,9 +51,28 @@ qmd multi-get "journals/2025-05*.md"
 # Search within a specific collection
 qmd search "API" -c notes
 
+# Search the UCS corpus directly
+qmd timeline "launchd watch daemon"
+qmd explain "filesystem watching disabled"
+qmd facts "who owns indexing"
+qmd diff "ucs://session/claude/test-session"
+
 # Export all matches for an agent
 qmd search "API" --all --files --min-score 0.3
 ```
+
+### UCS Read Plane
+
+When `UCS_STORE_PATH` is set, or when QMD can find the default UCS store at
+`~/.local/share/context/_state/store.sqlite`, these commands query the UCS
+canonical store directly:
+
+- `qmd timeline <query>` searches the UCS corpus and orders matches as events
+- `qmd facts <query>` searches promoted facts in the UCS fact table
+- `qmd explain <query>` shows lexical and recency scoring for UCS matches
+- `qmd entity <query>` shows the top UCS entity with recent revisions
+- `qmd diff <ucs://...>` compares UCS revisions
+- `qmd get <ucs://...>` hydrates a UCS revision or fact by URI
 
 ### Using with AI Agents
 

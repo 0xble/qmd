@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Changes
+
+- UCS read plane: add `timeline`, `facts`, `explain`, `entity`, and `diff`
+  commands backed by the canonical UCS SQLite store.
+- UCS hydration: `qmd get` now resolves `ucs://session/...` and
+  `ucs://fact/...` URIs directly from the UCS store.
+- Docs: document the UCS read-plane commands and default
+  `~/.local/share/context/_state/store.sqlite` store path in the README.
+
 ## [1.1.5] - 2026-03-07
 
 Ambiguous queries like "performance" now produce dramatically better results

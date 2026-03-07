@@ -13,6 +13,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
+import { openDatabase } from "../src/db.js";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -90,6 +91,125 @@ async function createIsolatedTestEnv(prefix: string): Promise<{ dbPath: string; 
   await mkdir(configDir, { recursive: true });
   await writeFile(join(configDir, "index.yml"), "collections: {}\n");
   return { dbPath, configDir };
+}
+
+async function createUcsStore(prefix: string): Promise<string> {
+  testCounter++;
+  const dbPath = join(testDir, `${prefix}-${testCounter}.sqlite`);
+  const db = openDatabase(dbPath);
+  db.exec(`
+    CREATE TABLE corpus_item (
+      id TEXT PRIMARY KEY,
+      source TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      external_id TEXT NOT NULL DEFAULT '',
+      title TEXT NOT NULL DEFAULT '',
+      canonical_uri TEXT NOT NULL DEFAULT '',
+      source_path TEXT NOT NULL DEFAULT '',
+      source_uri TEXT NOT NULL DEFAULT '',
+      source_open_cmd TEXT NOT NULL DEFAULT '',
+      current_revision_id INTEGER NOT NULL DEFAULT 0,
+      first_seen_at TEXT NOT NULL DEFAULT '',
+      last_seen_at TEXT NOT NULL DEFAULT '',
+      deleted_at TEXT NOT NULL DEFAULT ''
+    );
+    CREATE TABLE corpus_revision (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      item_id TEXT NOT NULL,
+      revision_key TEXT NOT NULL,
+      raw_sha256 TEXT NOT NULL DEFAULT '',
+      title TEXT NOT NULL DEFAULT '',
+      body TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT '',
+      event_at TEXT NOT NULL DEFAULT '',
+      ingested_at TEXT NOT NULL DEFAULT '',
+      source_ref TEXT NOT NULL DEFAULT '',
+      is_current INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE VIRTUAL TABLE corpus_fts USING fts5(uri, title, body, tokenize='porter unicode61');
+    CREATE TABLE fact (
+      id TEXT PRIMARY KEY,
+      statement TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0,
+      freshness TEXT NOT NULL DEFAULT '',
+      source_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL DEFAULT ''
+    );
+  `);
+
+  const rev1 = db.prepare(`
+    INSERT INTO corpus_revision (
+      item_id, revision_key, raw_sha256, title, body, created_at, event_at, ingested_at, source_ref, is_current
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+  `).run(
+    "session:claude:test-session",
+    "rev-1",
+    "sha-1",
+    "Watch daemon note",
+    "**user**: old question\n\n**assistant**: root filesystem watching stayed disabled",
+    "2026-03-05T10:00:00Z",
+    "2026-03-05T10:05:00Z",
+    "2026-03-05T10:06:00Z",
+    "claude:test-session"
+  );
+  const rev2 = db.prepare(`
+    INSERT INTO corpus_revision (
+      item_id, revision_key, raw_sha256, title, body, created_at, event_at, ingested_at, source_ref, is_current
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+  `).run(
+    "session:claude:test-session",
+    "rev-2",
+    "sha-2",
+    "Watch daemon note",
+    "**user**: latest question\n\n**assistant**: watch daemon runs under launchd and root filesystem watching is disabled",
+    "2026-03-06T10:00:00Z",
+    "2026-03-06T10:05:00Z",
+    "2026-03-06T10:06:00Z",
+    "claude:test-session"
+  );
+
+  db.prepare(`
+    INSERT INTO corpus_item (
+      id, source, kind, external_id, title, canonical_uri, source_path, source_uri, source_open_cmd,
+      current_revision_id, first_seen_at, last_seen_at, deleted_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')
+  `).run(
+    "session:claude:test-session",
+    "session",
+    "session",
+    "test-session",
+    "Watch daemon note",
+    "ucs://session/claude/test-session",
+    "/tmp/test-session.jsonl",
+    "file:///tmp/test-session.jsonl",
+    "open '/tmp/test-session.jsonl'",
+    Number(rev2.lastInsertRowid),
+    "2026-03-05T10:00:00Z",
+    "2026-03-06T10:06:00Z"
+  );
+  db.prepare(`
+    INSERT INTO corpus_fts(rowid, uri, title, body) VALUES (?, ?, ?, ?)
+  `).run(
+    Number(rev2.lastInsertRowid),
+    "ucs://session/claude/test-session",
+    "Watch daemon note",
+    "**user**: latest question\n\n**assistant**: watch daemon runs under launchd and root filesystem watching is disabled"
+  );
+  db.prepare(`
+    INSERT INTO fact (id, statement, confidence, freshness, source_count, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    "fact_01",
+    "Root filesystem watching is intentionally disabled",
+    0.95,
+    "current",
+    3,
+    "2026-03-06T12:00:00Z",
+    "2026-03-06T12:00:00Z"
+  );
+  db.close();
+  return dbPath;
 }
 
 // Setup test fixtures
@@ -491,6 +611,63 @@ describe("CLI Get Command", () => {
     const { stdout, exitCode } = await runQmd(["get", "nonexistent.md"]);
     // Should indicate file not found
     expect(exitCode).toBe(1);
+  });
+});
+
+describe("CLI UCS Commands", () => {
+  let ucsStorePath: string;
+
+  beforeEach(async () => {
+    ucsStorePath = await createUcsStore("ucs-cli");
+  });
+
+  test("retrieves UCS timeline results", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["timeline", "launchd disabled"],
+      { env: { UCS_STORE_PATH: ucsStorePath } }
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("ucs://session/claude/test-session");
+    expect(stdout).toContain("launchd");
+  });
+
+  test("retrieves a UCS document by URI", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["get", "ucs://session/claude/test-session"],
+      { env: { UCS_STORE_PATH: ucsStorePath } }
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("watch daemon runs under launchd");
+  });
+
+  test("queries UCS facts", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["facts", "filesystem watching"],
+      { env: { UCS_STORE_PATH: ucsStorePath } }
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("fact_01");
+    expect(stdout).toContain("intentionally disabled");
+  });
+
+  test("explains UCS ranking", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["explain", "launchd disabled"],
+      { env: { UCS_STORE_PATH: ucsStorePath } }
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("total_score");
+    expect(stdout).toContain("lexical_score");
+  });
+
+  test("diffs UCS revisions", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["diff", "ucs://session/claude/test-session"],
+      { env: { UCS_STORE_PATH: ucsStorePath } }
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("+ **user**: latest question");
+    expect(stdout).toContain("- **user**: old question");
   });
 });
 

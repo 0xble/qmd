@@ -71,6 +71,17 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
+import {
+  buildTimelineSnippet,
+  diffUcsDocument,
+  getDefaultUcsStorePath,
+  getUcsDocument,
+  hasUcsStore,
+  listEntity,
+  listFacts,
+  openUcsStore,
+  searchUcsTimeline,
+} from "./ucs-store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
 import {
   formatSearchResults,
@@ -886,7 +897,243 @@ function contextRemove(pathArg: string): void {
   console.log(`${c.green}✓${c.reset} Removed context for: qmd://${detected.collectionName}/${detected.relativePath}`);
 }
 
+function openRequiredUcsStore(): Database {
+  const path = getDefaultUcsStorePath()
+  if (!hasUcsStore(path)) {
+    console.error(`UCS store not found: ${path}`)
+    process.exit(1)
+  }
+  return openUcsStore(path)
+}
+
+function outputUcsTimelineRows(
+  rows: ReturnType<typeof searchUcsTimeline>,
+  query: string,
+  opts: OutputOptions
+): void {
+  if (rows.length === 0) {
+    console.log("No UCS timeline results found.")
+    return
+  }
+
+  if (opts.format === "json") {
+    console.log(JSON.stringify(rows.map((row) => ({
+      uri: row.uri,
+      source: row.source,
+      title: row.title,
+      eventAt: row.eventAt,
+      ingestedAt: row.ingestedAt,
+      score: row.totalScore,
+      lexicalScore: row.lexicalScore,
+      recencyScore: row.recencyScore,
+      matchedTerms: row.matchedTerms,
+      snippet: buildTimelineSnippet(row),
+      sourcePath: row.sourcePath,
+      sourceUri: row.sourceUri,
+      sourceOpenCmd: row.sourceOpenCmd,
+    })), null, 2))
+    return
+  }
+
+  if (opts.format === "files") {
+    for (const row of rows) {
+      console.log(row.uri)
+    }
+    return
+  }
+
+  for (const row of rows) {
+    const eventAt = row.eventAt || row.ingestedAt || "-"
+    const score = formatScore(row.totalScore)
+    const snippet = highlightTerms(buildTimelineSnippet(row), query)
+    console.log(`${eventAt}  ${row.source.padEnd(8)}  ${score}  ${row.uri}`)
+    console.log(`  ${row.title}`)
+    if (snippet) {
+      console.log(`  ${snippet}`)
+    }
+    console.log("")
+  }
+}
+
+function timelineSearch(query: string, opts: OutputOptions): void {
+  const db = openRequiredUcsStore()
+  try {
+    const rows = searchUcsTimeline(db, query, {
+      limit: opts.limit,
+      minScore: opts.minScore,
+      dateRange: opts.dateRange,
+      collection: opts.collection,
+    })
+    outputUcsTimelineRows(rows, query, opts)
+  } finally {
+    db.close()
+  }
+}
+
+function factsSearch(query: string, opts: OutputOptions): void {
+  const db = openRequiredUcsStore()
+  try {
+    const facts = listFacts(db, query, opts.limit)
+    if (facts.length === 0) {
+      console.log("No UCS facts found.")
+      return
+    }
+    if (opts.format === "json") {
+      console.log(JSON.stringify(facts, null, 2))
+      return
+    }
+    if (opts.format === "files") {
+      for (const fact of facts) {
+        console.log(`ucs://fact/${fact.id}`)
+      }
+      return
+    }
+    for (const fact of facts) {
+      console.log(`${fact.id}  ${fact.statement}`)
+      console.log(`  confidence: ${fact.confidence.toFixed(2)}`)
+      console.log(`  freshness: ${fact.freshness || "-"}`)
+      console.log(`  sources: ${fact.sourceCount}`)
+      console.log("")
+    }
+  } finally {
+    db.close()
+  }
+}
+
+function explainSearch(query: string, opts: OutputOptions): void {
+  const db = openRequiredUcsStore()
+  try {
+    const rows = searchUcsTimeline(db, query, {
+      limit: opts.limit,
+      minScore: opts.minScore,
+      dateRange: opts.dateRange,
+      collection: opts.collection,
+    })
+    if (rows.length === 0) {
+      console.log("No UCS matches to explain.")
+      return
+    }
+    if (opts.format === "json") {
+      console.log(JSON.stringify(rows.map((row) => ({
+        uri: row.uri,
+        totalScore: row.totalScore,
+        lexicalRaw: row.lexicalRaw,
+        lexicalScore: row.lexicalScore,
+        recencyScore: row.recencyScore,
+        matchedTerms: row.matchedTerms,
+        sourcePath: row.sourcePath,
+      })), null, 2))
+      return
+    }
+    console.log(`query: ${query}`)
+    console.log("")
+    rows.forEach((row, index) => {
+      console.log(`result ${index + 1}: ${row.uri}`)
+      console.log(`  total_score: ${row.totalScore.toFixed(3)}`)
+      console.log(`  lexical_score: ${row.lexicalScore.toFixed(3)}`)
+      console.log(`  lexical_raw: ${row.lexicalRaw.toFixed(3)}`)
+      console.log(`  recency_score: ${row.recencyScore.toFixed(3)}`)
+      console.log(`  matched_terms: ${row.matchedTerms.join(", ") || "-"}`)
+      console.log(`  source_path: ${row.sourcePath || "-"}`)
+      console.log("")
+    })
+  } finally {
+    db.close()
+  }
+}
+
+function entityShow(query: string, opts: OutputOptions): void {
+  const db = openRequiredUcsStore()
+  try {
+    const entity = listEntity(db, query)
+    if (!entity) {
+      console.log("No UCS entity found.")
+      return
+    }
+    if (opts.format === "json") {
+      console.log(JSON.stringify(entity, null, 2))
+      return
+    }
+    console.log(`entity: ${entity.title || entity.uri}`)
+    console.log(`type: ${entity.kind}`)
+    console.log(`source: ${entity.source}`)
+    console.log(`uri: ${entity.uri}`)
+    console.log(`latest_seen: ${entity.latestEventAt || "-"}`)
+    console.log("")
+    console.log("recent_revisions:")
+    for (const revision of entity.revisions) {
+      console.log(`  - ${revision.id} ${revision.eventAt || revision.ingestedAt || "-"} ${revision.title || entity.title}`)
+    }
+    if (entity.facts.length > 0) {
+      console.log("")
+      console.log("related_facts:")
+      for (const fact of entity.facts) {
+        console.log(`  - ${fact.statement}`)
+      }
+    }
+  } finally {
+    db.close()
+  }
+}
+
+function diffDocument(uri: string, revisionIds: number[], previous: boolean, opts: OutputOptions): void {
+  const db = openRequiredUcsStore()
+  try {
+    const result = diffUcsDocument(db, uri, {
+      revisionIds: revisionIds.length > 0 ? revisionIds : undefined,
+      previous,
+    })
+    if (!result) {
+      console.log("No UCS diff available.")
+      return
+    }
+    if (opts.format === "json") {
+      console.log(JSON.stringify(result, null, 2))
+      return
+    }
+    console.log(`${result.uri}`)
+    console.log(`left: revision ${result.left.id} (${result.left.eventAt || result.left.ingestedAt || "-"})`)
+    console.log(`right: revision ${result.right.id} (${result.right.eventAt || result.right.ingestedAt || "-"})`)
+    console.log("")
+    for (const line of result.diff) {
+      console.log(line)
+    }
+  } finally {
+    db.close()
+  }
+}
+
 function getDocument(filename: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean): void {
+  if (filename.startsWith("ucs://")) {
+    const db = openRequiredUcsStore()
+    try {
+      const doc = getUcsDocument(db, filename)
+      if (!doc) {
+        console.error(`Document not found: ${filename}`)
+        process.exit(1)
+      }
+      if (doc.type === "fact") {
+        console.log(doc.fact.statement)
+        return
+      }
+      let output = doc.revision.body
+      const startLine = fromLine || 1
+      if (fromLine !== undefined || maxLines !== undefined) {
+        const lines = output.split("\n")
+        const start = startLine - 1
+        const end = maxLines !== undefined ? start + maxLines : lines.length
+        output = lines.slice(start, end).join("\n")
+      }
+      if (lineNumbers) {
+        output = addLineNumbers(output, startLine)
+      }
+      console.log(output)
+      return
+    } finally {
+      db.close()
+    }
+  }
+
   const db = getDb();
 
   // Parse :linenum suffix from filename (e.g., "file.md:100")
@@ -2605,6 +2852,8 @@ function parseCLI() {
       // Query options
       "candidate-limit": { type: "string", short: "C" },
       intent: { type: "string" },
+      rev: { type: "string", multiple: true },
+      previous: { type: "boolean" },
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -2688,6 +2937,11 @@ function showHelp(): void {
   console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
   console.log("  qmd vsearch <query>           - Vector similarity only");
   console.log("  qmd get <file>[:line] [-l N]  - Show a single document, optional line slice");
+  console.log("  qmd timeline <query>          - Search UCS corpus and order matches as events");
+  console.log("  qmd facts <query>             - Query UCS curated facts");
+  console.log("  qmd explain <query>           - Show UCS score breakdown for matches");
+  console.log("  qmd diff <ucs://...>          - Compare UCS revisions");
+  console.log("  qmd entity <query>            - Show one UCS entity across revisions");
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
   console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
   console.log("");
@@ -2757,6 +3011,8 @@ function showHelp(): void {
   console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
+  console.log("  --rev <id>                 - Revision id for qmd diff (repeat twice)");
+  console.log("  --previous                 - Diff current revision against previous");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");
@@ -2764,6 +3020,7 @@ function showHelp(): void {
   console.log("  --json/--csv/--md/--xml/--files - Same formats as search");
   console.log("");
   console.log(`Index: ${getDbPath()}`);
+  console.log(`UCS store: ${getDefaultUcsStorePath()}`);
 }
 
 async function showVersion(): Promise<void> {
@@ -2893,6 +3150,50 @@ if (isMain) {
       const fromLine = cli.values.from ? parseInt(cli.values.from as string, 10) : undefined;
       const maxLines = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
       getDocument(cli.args[0], fromLine, maxLines, cli.opts.lineNumbers);
+      break;
+    }
+
+    case "timeline":
+      if (!cli.query) {
+        console.error("Usage: qmd timeline [options] <query>");
+        process.exit(1);
+      }
+      timelineSearch(cli.query, cli.opts);
+      break;
+
+    case "facts":
+      if (!cli.query) {
+        console.error("Usage: qmd facts [options] <query>");
+        process.exit(1);
+      }
+      factsSearch(cli.query, cli.opts);
+      break;
+
+    case "explain":
+      if (!cli.query) {
+        console.error("Usage: qmd explain [options] <query>");
+        process.exit(1);
+      }
+      explainSearch(cli.query, cli.opts);
+      break;
+
+    case "entity":
+      if (!cli.query) {
+        console.error("Usage: qmd entity [options] <query>");
+        process.exit(1);
+      }
+      entityShow(cli.query, cli.opts);
+      break;
+
+    case "diff": {
+      if (!cli.args[0]) {
+        console.error("Usage: qmd diff <ucs://...> [--previous] [--rev <id> --rev <id>]");
+        process.exit(1);
+      }
+      const revisionIds = ((cli.values.rev as string[] | undefined) || [])
+        .map((value) => parseInt(value, 10))
+        .filter((value) => Number.isFinite(value));
+      diffDocument(cli.args[0], revisionIds, !!cli.values.previous, cli.opts);
       break;
     }
 
