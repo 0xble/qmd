@@ -1447,6 +1447,25 @@ export function deactivateDocument(db: Database, collectionName: string, path: s
 }
 
 /**
+ * Deactivate documents for collections that are no longer configured.
+ */
+export function deactivateCollectionsExcept(db: Database, collectionNames: string[]): number {
+  if (collectionNames.length === 0) {
+    const result = db.prepare(`UPDATE documents SET active = 0 WHERE active = 1`).run();
+    return result.changes;
+  }
+
+  const placeholders = collectionNames.map(() => "?").join(", ");
+  const result = db.prepare(`
+    UPDATE documents
+    SET active = 0
+    WHERE active = 1
+      AND collection NOT IN (${placeholders})
+  `).run(...collectionNames);
+  return result.changes;
+}
+
+/**
  * Get all active document paths for a collection.
  */
 export function getActiveDocumentPaths(db: Database, collectionName: string): string[] {

@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs"
+import { createHash } from "node:crypto"
 import { openDatabase, type Database } from "./db.js"
 
 const DEFAULT_RECENCY_WEIGHT = 0.25
@@ -58,6 +59,13 @@ export type UcsFact = {
   sourceCount: number
   createdAt: string
   updatedAt: string
+}
+
+type DerivedFactCandidate = {
+  statement: string
+  sourceUris: Set<string>
+  latestAtMs: number
+  matchedTerms: number
 }
 
 export type UcsGetResult =
@@ -293,6 +301,288 @@ export function buildTimelineSnippet(row: UcsTimelineRow): string {
   return makeSnippet(row.body, row.matchedTerms)
 }
 
+function normalizeFactQueryTerms(query: string): string[] {
+  return query
+    .toLowerCase()
+    .split(/\s+/)
+    .map((term) => term.trim())
+    .filter((term) => term.length >= 3)
+    .filter((term, index, terms) => terms.indexOf(term) === index)
+}
+
+function cleanFactCandidate(text: string): string {
+  let candidate = text
+    .trim()
+    .replace(/^[-*+]\s*/, "")
+    .replace(/^\d+[.)]\s*/, "")
+    .replace(/^#+\s*/, "")
+    .replace(/^>\s*/, "")
+    .replace(/^`+|`+$/g, "")
+    .trim()
+
+  for (const prefix of ["and ", "but ", "so ", "then ", "also "]) {
+    if (candidate.toLowerCase().startsWith(prefix)) {
+      candidate = candidate.slice(prefix.length).trim()
+    }
+  }
+
+  if (!candidate) return ""
+  if (/^[a-z]/.test(candidate)) {
+    candidate = candidate.charAt(0).toUpperCase() + candidate.slice(1)
+  }
+  return candidate.replace(/\s+/g, " ")
+}
+
+function looksLikeDerivedFact(statement: string): boolean {
+  if (statement.length < 24 || statement.length > 240) return false
+  if (!/[a-z]/i.test(statement)) return false
+  const lower = statement.toLowerCase()
+
+  for (const prefix of [
+    "i ",
+    "i’m ",
+    "i'm ",
+    "i am ",
+    "i found ",
+    "i checked ",
+    "i'm checking ",
+    "i’m checking ",
+    "let me ",
+    "now ",
+    "next ",
+    "wait ",
+    "actually ",
+    "first ",
+    "second ",
+    "third ",
+    "finally ",
+    "here's ",
+    "here is ",
+    "the user ",
+    "user asked ",
+    "user wants ",
+    "we need to ",
+    "i need to ",
+    "i'm going to ",
+    "i am going to ",
+  ]) {
+    if (lower.startsWith(prefix)) return false
+  }
+
+  for (const fragment of [
+    "args={",
+    "command=",
+    "file_path=",
+    "replace_all",
+    "subagent",
+    "source_path:",
+    "source_uri:",
+    "source_open_cmd:",
+    "/users/",
+    "~/",
+    "http://",
+    "https://",
+    "github.com/",
+    "```",
+    "qmd facts",
+    "qmd timeline",
+    "installed qmd",
+    "observed results",
+    "behavioral issue",
+    "the sentence is in the corpus",
+    "current revisions contain",
+  ]) {
+    if (lower.includes(fragment)) return false
+  }
+
+  if (/\.md\b|\.json\b|\.plist\b/i.test(statement)) return false
+  if (!/^[A-Z0-9]/.test(statement)) return false
+
+  return [
+    " is ",
+    " are ",
+    " was ",
+    " were ",
+    " has ",
+    " have ",
+    " runs ",
+    " uses ",
+    " owns ",
+    " remains ",
+    " stays ",
+    " supports ",
+    " returns ",
+    " points ",
+    " stores ",
+    " writes ",
+    " reads ",
+  ].some((verb) => lower.includes(verb))
+}
+
+function splitFactSections(body: string): string[] {
+  const marker = /\*\*(user|assistant)\*\*:/gi
+  const matches = [...body.matchAll(marker)]
+  const sections: string[] = []
+
+  for (let index = 0; index < matches.length; index += 1) {
+    const match = matches[index]
+    if (!match?.[1] || match.index == null) continue
+    if (match[1].toLowerCase() !== "assistant") continue
+    const contentStart = match.index + match[0].length
+    const next = matches[index + 1]
+    const contentEnd = next?.index ?? body.length
+    const section = body.slice(contentStart, contentEnd).trim()
+    if (section) {
+      sections.push(section)
+    }
+  }
+
+  return sections.length > 0 ? sections : [body]
+}
+
+function extractDerivedFactStatements(body: string, queryTerms: string[]): string[] {
+  const seen = new Set<string>()
+  const statements: string[] = []
+
+  for (const section of splitFactSections(body)) {
+    const normalized = section
+      .replace(/```[\s\S]*?```/g, " ")
+      .replace(/`/g, "")
+      .replace(/\r/g, " ")
+      .replace(/\n+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+
+    if (!normalized) continue
+    const segments = normalized.split(/[.!?](?:\s+|$)/).map((segment) => segment.trim()).filter(Boolean)
+
+    for (const segment of segments) {
+      const candidates = new Set<string>()
+      const queue = [segment]
+
+      while (queue.length > 0) {
+        const next = cleanFactCandidate(queue.shift() || "")
+        if (!next || candidates.has(next)) continue
+        candidates.add(next)
+
+        const colon = next.lastIndexOf(":")
+        if (colon >= 0 && colon + 1 < next.length) {
+          queue.push(next.slice(colon + 1))
+        }
+
+        const lowerNext = next.toLowerCase()
+        for (const separator of [" but ", ", but ", " returned ", " contains ", " contain ", " - "]) {
+          const index = lowerNext.lastIndexOf(separator)
+          if (index >= 0 && index + separator.length < next.length) {
+            queue.push(next.slice(index + separator.length))
+          }
+        }
+
+        if (next.includes(",")) {
+          for (const part of next.split(",")) {
+            if (part.trim().split(/\s+/).length >= 4) {
+              queue.push(part)
+            }
+          }
+        }
+      }
+
+      for (const candidate of candidates) {
+        const cleaned = cleanFactCandidate(candidate)
+        if (!looksLikeDerivedFact(cleaned)) continue
+        const lower = cleaned.toLowerCase()
+        const matchedTerms = queryTerms.filter((term) => lower.includes(term))
+        if (matchedTerms.length === 0) continue
+        const statement = /[.!?]$/.test(cleaned) ? cleaned : `${cleaned}.`
+        if (seen.has(statement)) continue
+        seen.add(statement)
+        statements.push(statement)
+      }
+    }
+  }
+
+  return statements
+}
+
+function deriveFacts(db: Database, query: string, limit: number): UcsFact[] {
+  const terms = normalizeFactQueryTerms(query)
+  if (terms.length === 0) return []
+
+  const rows = searchUcsTimeline(db, query, {
+    limit: Math.max(limit * 5, 20),
+    minScore: 0,
+  })
+  const candidates = new Map<string, DerivedFactCandidate>()
+
+  for (const row of rows) {
+    const eventAtMs = Date.parse(row.eventAt || row.ingestedAt || "")
+    for (const statement of extractDerivedFactStatements(row.body, terms)) {
+      const lower = statement.toLowerCase()
+      const matchedTerms = terms.filter((term) => lower.includes(term)).length
+      const existing = candidates.get(statement)
+      if (existing) {
+        existing.sourceUris.add(row.uri)
+        existing.latestAtMs = Math.max(existing.latestAtMs, Number.isNaN(eventAtMs) ? 0 : eventAtMs)
+        existing.matchedTerms = Math.max(existing.matchedTerms, matchedTerms)
+        continue
+      }
+      candidates.set(statement, {
+        statement,
+        sourceUris: new Set([row.uri]),
+        latestAtMs: Number.isNaN(eventAtMs) ? 0 : eventAtMs,
+        matchedTerms,
+      })
+    }
+  }
+
+  return [...candidates.values()]
+    .sort((a, b) => {
+      if (b.matchedTerms !== a.matchedTerms) return b.matchedTerms - a.matchedTerms
+      if (b.sourceUris.size !== a.sourceUris.size) return b.sourceUris.size - a.sourceUris.size
+      return b.latestAtMs - a.latestAtMs
+    })
+    .slice(0, limit)
+    .map((candidate) => {
+      const confidence = Math.min(
+        0.85,
+        0.55
+          + (candidate.matchedTerms / Math.max(terms.length, 1)) * 0.15
+          + (candidate.sourceUris.size > 1 ? 0.1 : 0)
+      )
+      const freshness = candidate.latestAtMs > 0 && (Date.now() - candidate.latestAtMs) <= (30 * 24 * 60 * 60 * 1000)
+        ? "current"
+        : "historical"
+      const updatedAt = candidate.latestAtMs > 0 ? new Date(candidate.latestAtMs).toISOString() : ""
+      return {
+        id: `derived_${createHash("sha1").update(candidate.statement).digest("hex").slice(0, 12)}`,
+        statement: candidate.statement,
+        confidence,
+        freshness,
+        sourceCount: candidate.sourceUris.size,
+        createdAt: updatedAt,
+        updatedAt,
+      } satisfies UcsFact
+    })
+}
+
+function scoreFactForQuery(fact: UcsFact, terms: string[]): number {
+  if (!looksLikeDerivedFact(fact.statement)) return -1
+  const lower = fact.statement.toLowerCase()
+  const matchedTerms = terms.filter((term) => lower.includes(term)).length
+  const minMatchedTerms = terms.length > 1 ? 2 : 1
+  if (matchedTerms < minMatchedTerms) return -1
+  const freshnessBoost = fact.freshness === "current" ? 0.5 : 0
+  const updatedAt = Date.parse(fact.updatedAt || fact.createdAt || "")
+  const recencyBoost = Number.isNaN(updatedAt) ? 0 : (updatedAt / 1e13)
+  return (
+    matchedTerms * 10
+    + Math.min(fact.sourceCount, 10)
+    + fact.confidence
+    + freshnessBoost
+    + recencyBoost
+  )
+}
+
 export function listFacts(db: Database, query: string, limit: number): UcsFact[] {
   const trimmed = query.trim().toLowerCase()
   if (!trimmed) return []
@@ -317,6 +607,30 @@ export function listFacts(db: Database, query: string, limit: number): UcsFact[]
   }))
 }
 
+export function searchFacts(db: Database, query: string, limit: number): UcsFact[] {
+  const terms = normalizeFactQueryTerms(query)
+  if (terms.length === 0) {
+    return []
+  }
+  const curated = listFacts(db, query, Math.max(limit * 10, 20))
+  const derived = deriveFacts(db, query, Math.max(limit * 3, 10))
+  const merged = new Map<string, UcsFact>()
+
+  for (const fact of [...curated, ...derived]) {
+    const existing = merged.get(fact.statement)
+    if (!existing || scoreFactForQuery(fact, terms) > scoreFactForQuery(existing, terms)) {
+      merged.set(fact.statement, fact)
+    }
+  }
+
+  return [...merged.values()]
+    .map((fact) => ({ fact, score: scoreFactForQuery(fact, terms) }))
+    .filter((entry) => entry.score >= 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((entry) => entry.fact)
+}
+
 export function getUcsDocument(db: Database, uri: string): UcsGetResult | null {
   const factMatch = uri.match(/^ucs:\/\/fact\/([^/]+)$/)
   if (factMatch?.[1]) {
@@ -332,23 +646,23 @@ export function getUcsDocument(db: Database, uri: string): UcsGetResult | null {
     }
   }
 
-  const parsed = parseUcsSessionUri(uri)
-  if (!parsed) return null
-  const revision = parsed.revisionId != null
+  const resolved = resolveUcsRevisionTarget(db, uri)
+  if (!resolved) return null
+  const revision = resolved.revisionId != null
     ? db.prepare(
         `SELECT r.id, r.item_id, r.revision_key, r.title, r.body, r.event_at, r.ingested_at, r.is_current
          FROM corpus_revision r
          WHERE r.id = ?`
-      ).get(parsed.revisionId)
+      ).get(resolved.revisionId)
     : db.prepare(
         `SELECT r.id, r.item_id, r.revision_key, r.title, r.body, r.event_at, r.ingested_at, r.is_current
          FROM corpus_revision r
          JOIN corpus_item i ON i.current_revision_id = r.id
          WHERE i.id = ? AND i.deleted_at = ''`
-      ).get(parsed.itemId)
+      ).get(resolved.itemId)
   const item = db.prepare(
     `SELECT source_path, source_uri, source_open_cmd FROM corpus_item WHERE id = ?`
-  ).get(parsed.itemId) as { source_path: string; source_uri: string; source_open_cmd: string } | null
+  ).get(resolved.itemId) as { source_path: string; source_uri: string; source_open_cmd: string } | null
   if (!revision || !item) return null
   return {
     type: "revision",
@@ -367,6 +681,27 @@ export function getUcsDocument(db: Database, uri: string): UcsGetResult | null {
     sourceUri: String(item.source_uri || ""),
     sourceOpenCmd: String(item.source_open_cmd || ""),
   }
+}
+
+function resolveUcsRevisionTarget(db: Database, uri: string): {
+  itemId: string
+  revisionId?: number
+} | null {
+  const revisionMatch = uri.match(/^(ucs:\/\/.+)\/revision\/(\d+)$/)
+  const baseUri = revisionMatch?.[1] ? revisionMatch[1] : uri
+  const revisionId = revisionMatch?.[2] ? Number(revisionMatch[2]) : undefined
+
+  const item = db.prepare(
+    `SELECT id FROM corpus_item WHERE canonical_uri = ? LIMIT 1`
+  ).get(baseUri) as { id: string } | null
+  if (item?.id) {
+    return {
+      itemId: String(item.id),
+      revisionId,
+    }
+  }
+
+  return parseUcsSessionUri(uri)
 }
 
 export function parseUcsSessionUri(uri: string): {
@@ -396,7 +731,7 @@ export function listEntity(db: Database, query: string): UcsEntityResult | null 
      ORDER BY event_at DESC, id DESC
      LIMIT 5`
   ).all(top.itemId) as Array<Record<string, any>>
-  const facts = listFacts(db, query, 5)
+  const facts = searchFacts(db, query, 5)
   return {
     itemId: top.itemId,
     source: top.source,
@@ -533,8 +868,8 @@ export function diffUcsDocument(
     previous?: boolean
   } = {}
 ): UcsDiffResult | null {
-  const parsed = parseUcsSessionUri(uri)
-  if (!parsed) return null
+  const resolved = resolveUcsRevisionTarget(db, uri)
+  if (!resolved) return null
   let left: UcsRevision | null = null
   let right: UcsRevision | null = null
 
@@ -542,7 +877,7 @@ export function diffUcsDocument(
     left = getRevisionById(db, opts.revisionIds[0]!)
     right = getRevisionById(db, opts.revisionIds[1]!)
   } else {
-    const pair = getCurrentAndPreviousRevision(db, parsed.itemId, parsed.revisionId)
+    const pair = getCurrentAndPreviousRevision(db, resolved.itemId, resolved.revisionId)
     if (pair) {
       left = pair.left
       right = pair.right

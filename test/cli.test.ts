@@ -93,7 +93,7 @@ async function createIsolatedTestEnv(prefix: string): Promise<{ dbPath: string; 
   return { dbPath, configDir };
 }
 
-async function createUcsStore(prefix: string): Promise<string> {
+async function createUcsStore(prefix: string, opts: { withFact?: boolean } = {}): Promise<string> {
   testCounter++;
   const dbPath = join(testDir, `${prefix}-${testCounter}.sqlite`);
   const db = openDatabase(dbPath);
@@ -196,18 +196,62 @@ async function createUcsStore(prefix: string): Promise<string> {
     "Watch daemon note",
     "**user**: latest question\n\n**assistant**: watch daemon runs under launchd and root filesystem watching is disabled"
   );
-  db.prepare(`
-    INSERT INTO fact (id, statement, confidence, freshness, source_count, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+  if (opts.withFact !== false) {
+    db.prepare(`
+      INSERT INTO fact (id, statement, confidence, freshness, source_count, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      "fact_01",
+      "Root filesystem watching is intentionally disabled",
+      0.95,
+      "current",
+      3,
+      "2026-03-06T12:00:00Z",
+      "2026-03-06T12:00:00Z"
+    );
+  }
+  const docRev = db.prepare(`
+    INSERT INTO corpus_revision (
+      item_id, revision_key, raw_sha256, title, body, created_at, event_at, ingested_at, source_ref, is_current
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
   `).run(
-    "fact_01",
-    "Root filesystem watching is intentionally disabled",
-    0.95,
-    "current",
-    3,
-    "2026-03-06T12:00:00Z",
-    "2026-03-06T12:00:00Z"
-  );
+    "email:envelope:acct:inbox:123",
+    "email-rev-1",
+    "email-sha-1",
+    "Shipping update",
+    "# Shipping update\n\nPackage arrived this morning.",
+    "2026-03-04T09:00:00Z",
+    "2026-03-04T09:05:00Z",
+    "2026-03-04T09:06:00Z",
+    "acct:inbox:123"
+  )
+  db.prepare(`
+    INSERT INTO corpus_item (
+      id, source, kind, external_id, title, canonical_uri, source_path, source_uri, source_open_cmd,
+      current_revision_id, first_seen_at, last_seen_at, deleted_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')
+  `).run(
+    "email:envelope:acct:inbox:123",
+    "email",
+    "email",
+    "envelope:acct:inbox:123",
+    "Shipping update",
+    "ucs://doc/email/envelope%3Aacct%3Ainbox%3A123",
+    "/tmp/context/email/acct/2026/03/message.md",
+    "gmail://message/123",
+    "gog gmail read 123",
+    Number(docRev.lastInsertRowid),
+    "2026-03-04T09:00:00Z",
+    "2026-03-04T09:06:00Z"
+  )
+  db.prepare(`
+    INSERT INTO corpus_fts(rowid, uri, title, body) VALUES (?, ?, ?, ?)
+  `).run(
+    Number(docRev.lastInsertRowid),
+    "ucs://doc/email/envelope%3Aacct%3Ainbox%3A123",
+    "Shipping update",
+    "# Shipping update\n\nPackage arrived this morning."
+  )
   db.close();
   return dbPath;
 }
@@ -640,6 +684,15 @@ describe("CLI UCS Commands", () => {
     expect(stdout).toContain("watch daemon runs under launchd");
   });
 
+  test("retrieves a generic UCS document by URI", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["get", "ucs://doc/email/envelope%3Aacct%3Ainbox%3A123"],
+      { env: { UCS_STORE_PATH: ucsStorePath } }
+    )
+    expect(exitCode).toBe(0)
+    expect(stdout).toContain("Package arrived this morning.")
+  })
+
   test("queries UCS facts", async () => {
     const { stdout, exitCode } = await runQmd(
       ["facts", "filesystem watching"],
@@ -649,6 +702,39 @@ describe("CLI UCS Commands", () => {
     expect(stdout).toContain("fact_01");
     expect(stdout).toContain("intentionally disabled");
   });
+
+  test("derives UCS facts from timeline when curated facts are missing", async () => {
+    const derivedStorePath = await createUcsStore("ucs-cli-derived", { withFact: false })
+    const { stdout, exitCode } = await runQmd(
+      ["facts", "filesystem watching"],
+      { env: { UCS_STORE_PATH: derivedStorePath } }
+    )
+    expect(exitCode).toBe(0)
+    expect(stdout).toContain("derived_")
+    expect(stdout.toLowerCase()).toContain("root filesystem watching is disabled")
+  })
+
+  test("filters meta narration and extracts the embedded fact", async () => {
+    const derivedStorePath = await createUcsStore("ucs-cli-meta", { withFact: false })
+    const db = openDatabase(derivedStorePath)
+    db.exec(`
+      UPDATE corpus_revision
+      SET body = '**user**: qa check\n\n**assistant**: Entity - installed qmd timeline returned ucs://session/claude/test-session - installed qmd facts returned Root filesystem watching remains disabled.'
+      WHERE item_id = 'session:claude:test-session' AND is_current = 1;
+      UPDATE corpus_fts
+      SET body = '**user**: qa check\n\n**assistant**: Entity - installed qmd timeline returned ucs://session/claude/test-session - installed qmd facts returned Root filesystem watching remains disabled.'
+      WHERE uri = 'ucs://session/claude/test-session';
+    `)
+    db.close()
+
+    const { stdout, exitCode } = await runQmd(
+      ["facts", "filesystem watching"],
+      { env: { UCS_STORE_PATH: derivedStorePath } }
+    )
+    expect(exitCode).toBe(0)
+    expect(stdout.toLowerCase()).toContain("root filesystem watching remains disabled")
+    expect(stdout.toLowerCase()).not.toContain("installed qmd")
+  })
 
   test("explains UCS ranking", async () => {
     const { stdout, exitCode } = await runQmd(
@@ -755,6 +841,115 @@ ${token}
 
     const after = await runQmd(["get", "qmd://empty-check/only.md"], { dbPath, configDir });
     expect(after.exitCode).toBe(1);
+  });
+
+  test("keeps exact relative paths when filenames would otherwise collide", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("update-paths");
+    const collectionDir = join(testDir, `update-paths-${Date.now()}`);
+    await mkdir(join(collectionDir, "_15037156061"), { recursive: true });
+    await mkdir(join(collectionDir, "15037156061"), { recursive: true });
+
+    await writeFile(
+      join(collectionDir, "_15037156061", "2026-02.md"),
+      `---
+date: 2026-02-01
+---
+# Underscore thread
+keep exact path A
+`
+    );
+    await writeFile(
+      join(collectionDir, "15037156061", "2026-02.md"),
+      `---
+date: 2026-02-02
+---
+# Plain thread
+keep exact path B
+`
+    );
+
+    const add = await runQmd(
+      ["collection", "add", collectionDir, "--name", "messages"],
+      { dbPath, configDir }
+    );
+    expect(add.exitCode).toBe(0);
+
+    const db = openDatabase(dbPath);
+    const count = db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM documents
+      WHERE collection = 'messages' AND active = 1
+    `).get() as { count: number };
+    expect(count.count).toBe(2);
+
+    const first = await runQmd(
+      ["get", "qmd://messages/_15037156061/2026-02.md"],
+      { dbPath, configDir }
+    );
+    expect(first.exitCode).toBe(0);
+    expect(first.stdout).toContain("keep exact path A");
+
+    const second = await runQmd(
+      ["get", "qmd://messages/15037156061/2026-02.md"],
+      { dbPath, configDir }
+    );
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout).toContain("keep exact path B");
+
+    db.close();
+  });
+
+  test("deactivates docs from collections removed from config", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("update-prune");
+    const keepDir = join(testDir, `update-prune-keep-${Date.now()}`);
+    const retireDir = join(testDir, `update-prune-retire-${Date.now()}`);
+    await mkdir(keepDir, { recursive: true });
+    await mkdir(retireDir, { recursive: true });
+
+    await writeFile(
+      join(keepDir, "keep.md"),
+      `---
+date: 2026-03-06
+---
+# Keep
+still configured
+`
+    );
+    await writeFile(
+      join(retireDir, "retire.md"),
+      `---
+date: 2026-03-06
+---
+# Retire
+remove me
+`
+    );
+
+    expect((await runQmd(["collection", "add", keepDir, "--name", "keep"], { dbPath, configDir })).exitCode).toBe(0);
+    expect((await runQmd(["collection", "add", retireDir, "--name", "retire"], { dbPath, configDir })).exitCode).toBe(0);
+
+    writeFileSync(
+      join(configDir, "index.yml"),
+      `collections:
+  keep:
+    path: ${keepDir}
+    pattern: "**/*.md"
+`
+    );
+
+    const update = await runQmd(["update"], { dbPath, configDir });
+    expect(update.exitCode).toBe(0);
+
+    const db = openDatabase(dbPath);
+    const active = db.prepare(`
+      SELECT collection, COUNT(*) AS count
+      FROM documents
+      WHERE active = 1
+      GROUP BY collection
+      ORDER BY collection
+    `).all() as { collection: string; count: number }[];
+    expect(active).toEqual([{ collection: "keep", count: 1 }]);
+    db.close();
   });
 });
 
@@ -1005,8 +1200,7 @@ describe("CLI ls Command", () => {
   test("lists files in a collection", async () => {
     const { stdout, exitCode } = await runQmd(["ls", "fixtures"], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
-    // handelize converts to lowercase
-    expect(stdout).toContain("qmd://fixtures/readme.md");
+    expect(stdout).toContain("qmd://fixtures/README.md");
     expect(stdout).toContain("qmd://fixtures/notes/meeting.md");
   });
 
@@ -1015,8 +1209,7 @@ describe("CLI ls Command", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("qmd://fixtures/notes/meeting.md");
     expect(stdout).toContain("qmd://fixtures/notes/ideas.md");
-    // Should not include files outside the prefix (handelize converts to lowercase)
-    expect(stdout).not.toContain("qmd://fixtures/readme.md");
+    expect(stdout).not.toContain("qmd://fixtures/README.md");
   });
 
   test("lists files with virtual path", async () => {
@@ -1517,9 +1710,17 @@ describe("mcp http daemon", () => {
     });
   }
 
-  /** Spawn a foreground HTTP server (non-blocking) and return the process */
-  function spawnHttpServer(port: number): import("child_process").ChildProcess {
-    const proc = spawn(tsxBin, [qmdScript, "mcp", "--http", "--port", String(port)], {
+  /** Spawn a foreground HTTP server and expose a readiness signal */
+  function spawnHttpServer(port: number): {
+    proc: import("child_process").ChildProcess
+    ready: Promise<boolean>
+  } {
+    const useBunRuntime = Boolean((process as typeof process & { versions: NodeJS.ProcessVersions & { bun?: string } }).versions.bun);
+    const command = useBunRuntime ? process.execPath : tsxBin;
+    const args = useBunRuntime
+      ? [qmdScript, "mcp", "--http", "--port", String(port)]
+      : [qmdScript, "mcp", "--http", "--port", String(port)];
+    const proc = spawn(command, args, {
       cwd: fixturesDir,
       env: {
         ...process.env,
@@ -1528,8 +1729,30 @@ describe("mcp http daemon", () => {
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
+
+    const readyMarker = `QMD MCP server listening on http://localhost:${port}/mcp`;
+    let settled = false;
+    let output = "";
+    const ready = new Promise<boolean>((resolve) => {
+      const settle = (value: boolean) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      const onData = (chunk: Buffer) => {
+        output += chunk.toString();
+        if (output.includes(readyMarker)) {
+          settle(true);
+        }
+      };
+      proc.stdout?.on("data", onData);
+      proc.stderr?.on("data", onData);
+      proc.once("error", () => settle(false));
+      proc.once("exit", () => settle(false));
+    });
+
     if (proc.pid) spawnedPids.push(proc.pid);
-    return proc;
+    return { proc, ready };
   }
 
   /** Wait for HTTP server to become ready */
@@ -1583,13 +1806,16 @@ describe("mcp http daemon", () => {
   // Foreground HTTP
   // -------------------------------------------------------------------------
 
-  test("foreground HTTP server starts and responds to health check", async () => {
+  test("foreground HTTP server starts and responds to health check", { timeout: 15_000 }, async () => {
     const port = randomPort();
-    const proc = spawnHttpServer(port);
+    const { proc, ready } = spawnHttpServer(port);
 
     try {
-      const ready = await waitForServer(port);
-      expect(ready).toBe(true);
+      const started = await Promise.race([
+        ready,
+        sleep(10_000).then(() => false),
+      ]);
+      expect(started).toBe(true);
 
       const res = await fetch(`http://localhost:${port}/health`);
       expect(res.status).toBe(200);

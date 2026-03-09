@@ -48,6 +48,7 @@ import {
   updateDocumentTitle,
   updateDocument,
   deactivateDocument,
+  deactivateCollectionsExcept,
   getActiveDocumentPaths,
   cleanupOrphanedContent,
   deleteLLMCache,
@@ -56,7 +57,7 @@ import {
   vacuumDatabase,
   getCollectionsWithoutContext,
   getTopLevelPathsWithoutContext,
-  handelize,
+  normalizePathSeparators,
   hybridQuery,
   vectorSearchQuery,
   structuredSearch,
@@ -78,7 +79,7 @@ import {
   getUcsDocument,
   hasUcsStore,
   listEntity,
-  listFacts,
+  searchFacts,
   openUcsStore,
   searchUcsTimeline,
 } from "./ucs-store.js";
@@ -636,7 +637,6 @@ async function showStatus(): Promise<void> {
 
 async function updateCollections(): Promise<void> {
   const db = getDb();
-  // Collections are defined in YAML; no duplicate cleanup needed.
 
   // Clear Ollama cache on update
   clearCache(db);
@@ -651,6 +651,12 @@ async function updateCollections(): Promise<void> {
 
   // Don't close db here - indexFiles will reuse it and close at the end
   console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
+
+  const configuredNames = collections.map(col => col.name);
+  const retiredCollections = deactivateCollectionsExcept(db, configuredNames);
+  if (retiredCollections > 0) {
+    cleanupOrphanedContent(db);
+  }
 
   for (let i = 0; i < collections.length; i++) {
     const col = collections[i];
@@ -973,7 +979,7 @@ function timelineSearch(query: string, opts: OutputOptions): void {
 function factsSearch(query: string, opts: OutputOptions): void {
   const db = openRequiredUcsStore()
   try {
-    const facts = listFacts(db, query, opts.limit)
+    const facts = searchFacts(db, query, opts.limit)
     if (facts.length === 0) {
       console.log("No UCS facts found.")
       return
@@ -1864,7 +1870,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
     for (const relativeFile of files) {
       const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
-      const path = handelize(relativeFile); // Normalize path for token-friendliness
+      const path = normalizePathSeparators(relativeFile);
       seenPaths.add(path);
 
       let content: string;

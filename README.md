@@ -63,9 +63,8 @@ qmd search "API" --all --files --min-score 0.3
 
 ### UCS Read Plane
 
-When `UCS_STORE_PATH` is set, or when QMD can find the default UCS store at
-`~/.local/share/context/_state/store.sqlite`, these commands query the UCS
-canonical store directly:
+These commands use the UCS canonical store at `UCS_STORE_PATH` or, by default,
+`~/.local/share/context/_state/store.sqlite`:
 
 - `qmd timeline <query>` searches the UCS corpus and orders matches as events
 - `qmd facts <query>` searches promoted facts in the UCS fact table
